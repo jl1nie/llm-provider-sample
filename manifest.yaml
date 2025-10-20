@@ -1,4 +1,4 @@
-version: 0.0.5
+version: 0.1.0
 type: plugin
 author: jl1nie
 name: llm-provider-sample
@@ -33,13 +33,13 @@ plugins:
   models:
     - provider/llm-provider-sample.yaml
 meta:
-  version: 0.0.5
+  version: 0.1.0
   arch:
     - amd64
     - arm64
   runner:
     language: python
-    version: "3.12"
+    version: "3.13"
     entrypoint: main
   minimum_dify_version: "1.9.1"
 created_at: 2025-10-18T13:50:20.997742956+09:00

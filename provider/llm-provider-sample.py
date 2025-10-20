@@ -10,62 +10,106 @@ logger = logging.getLogger(__name__)
 
 
 class LlmProviderSampleModelProvider(ModelProvider):
-    def validate_provider_credentials(self, credentials: Mapping) -> None:
+    def validate_provider_credentials(self, credentials: Mapping[str, Any]) -> None:
         """
-        Validate provider credentials
-        if validate failed, raise exception
-
-        :param credentials: provider credentials, credentials form defined in `provider_credential_schema`.
+        Validate provider credentials. Raises CredentialsValidateFailedError if invalid.
         """
         try:
-            api_base = credentials.get("api_base")
-            api_key = credentials.get("api_key")
-            if not isinstance(api_base, str) or not api_base.strip():
-                raise CredentialsValidateFailedError("API base endpoint is required.")
-
-            parsed = urlparse(api_base.strip())
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise CredentialsValidateFailedError("API base must be a valid HTTP(S) URL.")
-
-            if not isinstance(api_key, str) or not api_key.strip():
+            api_base = self._extract_required_str(
+                credentials, ("openai_api_base", "api_base")
+            )
+            self._validate_url(api_base)
+            api_key = self._extract_required_str(
+                credentials, ("openai_api_key", "api_key")
+            )
+            if not api_key:
                 raise CredentialsValidateFailedError("API key is required.")
 
-            for field in ("sync_timeout", "async_timeout", "non_sse_chunk_count"):
-                self._validate_positive_int(credentials, field)
-
-            if (
-                isinstance(credentials.get("async_timeout"), int)
-                and isinstance(credentials.get("sync_timeout"), int)
-                and credentials["async_timeout"] < credentials["sync_timeout"]
-            ):
-                raise CredentialsValidateFailedError("Stream timeout must be greater than or equal to sync timeout.")
-        except CredentialsValidateFailedError as ex:
-            raise ex
-        except Exception as ex:
-            logger.exception(
-                f"{self.get_provider_schema().provider} credentials validate failed"
+            sync_timeout = self._coerce_positive_float(
+                credentials.get("sync_timeout"), default=30.0, field="sync_timeout"
             )
-            raise ex
+            async_timeout = self._coerce_positive_float(
+                credentials.get("async_timeout"), default=120.0, field="async_timeout"
+            )
+            if async_timeout < sync_timeout:
+                raise CredentialsValidateFailedError(
+                    "Stream timeout must be greater than or equal to sync timeout."
+                )
+            self._coerce_positive_int(
+                credentials.get("non_sse_chunk_count"),
+                default=4,
+                field="non_sse_chunk_count",
+            )
+        except CredentialsValidateFailedError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception(
+                "%s credentials validate failed", self.get_provider_schema().provider
+            )
+            raise exc
 
     @staticmethod
-    def _validate_positive_int(credentials: Mapping[str, Any], field: str) -> None:
-        """
-        Validate a credential field that should be a positive integer when provided.
-        """
-        if field not in credentials:
-            return
-        value = credentials.get(field)
-        if value is None or value == "":
-            return
+    def _extract_required_str(
+        credentials: Mapping[str, Any],
+        keys: tuple[str, ...],
+    ) -> str:
+        for key in keys:
+            value = credentials.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        raise CredentialsValidateFailedError(f"{keys[0]} is required.")
+
+    @staticmethod
+    def _validate_url(url: str) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise CredentialsValidateFailedError(
+                "API base must be a valid HTTP(S) URL."
+            )
+
+    @staticmethod
+    def _coerce_positive_int(value: Any, *, default: int, field: str) -> int:
+        if value in (None, ""):
+            return default
         if isinstance(value, bool):
-            raise CredentialsValidateFailedError(f"{field} must be a positive integer.")
-        if isinstance(value, str):
-            if not value.strip():
-                return
-            if not value.isdigit():
-                raise CredentialsValidateFailedError(f"{field} must be a positive integer.")
-            value = int(value)
-        if not isinstance(value, int):
-            raise CredentialsValidateFailedError(f"{field} must be a positive integer.")
-        if value <= 0:
-            raise CredentialsValidateFailedError(f"{field} must be a positive integer.")
+            raise CredentialsValidateFailedError(
+                f"{field} must be a positive integer."
+            )
+        if isinstance(value, int):
+            candidate = value
+        elif isinstance(value, str):
+            candidate = int(value.strip()) if value.strip().isdigit() else None
+        else:
+            candidate = None
+        if candidate is None or candidate <= 0:
+            raise CredentialsValidateFailedError(
+                f"{field} must be a positive integer."
+            )
+        return candidate
+
+    @staticmethod
+    def _coerce_positive_float(value: Any, *, default: float, field: str) -> float:
+        if value in (None, ""):
+            return default
+        if isinstance(value, bool):
+            raise CredentialsValidateFailedError(
+                f"{field} must be a positive number."
+            )
+        if isinstance(value, (int, float)):
+            candidate = float(value)
+        elif isinstance(value, str):
+            try:
+                candidate = float(value.strip())
+            except ValueError as exc:  # pragma: no cover - defensive
+                raise CredentialsValidateFailedError(
+                    f"{field} must be a positive number."
+                ) from exc
+        else:
+            raise CredentialsValidateFailedError(
+                f"{field} must be a positive number."
+            )
+        if candidate <= 0:
+            raise CredentialsValidateFailedError(
+                f"{field} must be a positive number."
+            )
+        return candidate

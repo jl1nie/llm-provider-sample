@@ -1,52 +1,55 @@
+import base64
+import copy
+import io
 import json
 import logging
 import math
 from collections.abc import Generator, Sequence
-from typing import Any, Optional, Union
+from typing import Optional, Union, cast, Any
 
-import httpx
-
-from dify_plugin import LargeLanguageModel
-from dify_plugin.entities.model import AIModelEntity
+import tiktoken
+from PIL import Image
+from httpx import Timeout
+from dify_plugin.entities.model import AIModelEntity, ModelPropertyKey
 from dify_plugin.entities.model.llm import (
+    LLMMode,
     LLMResult,
     LLMResultChunk,
     LLMResultChunkDelta,
-    LLMUsage,
 )
 from dify_plugin.entities.model.message import (
     AssistantPromptMessage,
+    AudioPromptMessageContent,
+    ImagePromptMessageContent,
     PromptMessage,
     PromptMessageContentType,
-    PromptMessageRole,
+    PromptMessageFunction,
     PromptMessageTool,
+    SystemPromptMessage,
+    TextPromptMessageContent,
     ToolPromptMessage,
+    UserPromptMessage,
 )
-from dify_plugin.errors.model import (
-    CredentialsValidateFailedError,
-    InvokeAuthorizationError,
-    InvokeBadRequestError,
-    InvokeConnectionError,
-    InvokeError,
-    InvokeRateLimitError,
-    InvokeServerUnavailableError,
+from dify_plugin.errors.model import CredentialsValidateFailedError
+from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
+from openai import AzureOpenAI, Stream
+from openai.types import Completion
+from openai.types.chat import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatCompletionMessageToolCall,
 )
+from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDelta
 
-from ..model_catalog import resolve_llm_model
+from ..common import _CommonAzureOpenAI
+from ..constants import LLM_BASE_MODELS, get_llm_base_model
 
 logger = logging.getLogger(__name__)
 
+THINKING_SERIES_COMPATIBILITY = ("o", "gpt-5")
 
-class LlmProviderSampleLargeLanguageModel(LargeLanguageModel):
-    """
-    Azure OpenAI compatible large language model provider.
-    """
 
-    DEFAULT_NON_SSE_CHUNK = 4
-    DEFAULT_SYNC_TIMEOUT = 30
-    DEFAULT_ASYNC_TIMEOUT = 120
-    DEFAULT_API_VERSION = "2024-02-15-preview"
-
+class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
     def _invoke(
         self,
         model: str,
@@ -57,75 +60,36 @@ class LlmProviderSampleLargeLanguageModel(LargeLanguageModel):
         stop: Optional[list[str]] = None,
         stream: bool = True,
         user: Optional[str] = None,
-    ) -> Union[LLMResult, Generator[LLMResultChunk, None, None]]:
-        """
-        Invoke large language model.
-        """
-        config = self._resolve_llm_config(credentials)
-        supports_sse = config.supports_sse
-        effective_stream = stream and supports_sse
-
-        try:
-            api_base = self._get_api_base(credentials)
-            deployment = self._get_deployment_name(model, credentials)
-            params = self._build_query_params(credentials)
-            headers = self._build_headers(credentials)
-            messages = self._convert_prompt_messages(prompt_messages)
-            payload = self._build_payload(
+    ) -> Union[LLMResult, Generator]:
+        base_model_name = self._get_base_model_name(credentials)
+        ai_model_entity = self._get_ai_model_entity(
+            base_model_name=base_model_name, model=model
+        )
+        if (
+            ai_model_entity
+            and ai_model_entity.entity.model_properties.get(ModelPropertyKey.MODE)
+            == LLMMode.CHAT.value
+        ):
+            return self._chat_generate(
                 model=model,
-                messages=messages,
-                model_parameters=model_parameters or {},
+                credentials=credentials,
+                prompt_messages=prompt_messages,
+                model_parameters=model_parameters,
                 tools=tools,
                 stop=stop,
-                stream=effective_stream,
+                stream=stream,
                 user=user,
             )
-            timeout = self._select_timeout(credentials, effective_stream)
-            url = self._build_chat_url(api_base, deployment)
-
-            if effective_stream:
-                return self._stream_chat(
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    payload=payload,
-                    timeout=timeout,
-                    model=model,
-                    prompt_messages=prompt_messages,
-                )
-
-            response_json = self._post_chat(
-                url=url,
-                headers=headers,
-                params=params,
-                payload=payload,
-                timeout=timeout,
-            )
-
-            if stream and not supports_sse:
-                return self._to_stream_from_completion(
-                    response=response_json,
-                    model=model,
-                    prompt_messages=prompt_messages,
-                    credentials=credentials,
-                )
-
-            return self._build_llm_result_from_response(
-                response=response_json,
+        else:
+            return self._generate(
                 model=model,
+                credentials=credentials,
                 prompt_messages=prompt_messages,
+                model_parameters=model_parameters,
+                stop=stop,
+                stream=stream,
+                user=user,
             )
-        except CredentialsValidateFailedError:
-            raise
-        except httpx.HTTPStatusError as exc:
-            logger.exception("HTTP error while invoking model %s", model)
-            raise self._map_http_error(exc, is_validation=False) from exc
-        except httpx.HTTPError as exc:
-            logger.exception("HTTP error while invoking model %s", model)
-            raise InvokeConnectionError(f"Provider request failed: {exc}") from exc
-        except Exception:
-            logger.exception("Unexpected error while invoking model %s", model)
-            raise
 
     def get_num_tokens(
         self,
@@ -134,536 +98,979 @@ class LlmProviderSampleLargeLanguageModel(LargeLanguageModel):
         prompt_messages: list[PromptMessage],
         tools: Optional[list[PromptMessageTool]] = None,
     ) -> int:
-        """
-        Estimate number of tokens based on prompt text length.
-        """
-        # Rough heuristic: assume 4 characters per token as a safe default.
-        total_chars = sum(message.get_text_content().__len__() for message in prompt_messages)
-        return max(0, math.ceil(total_chars / 4)) if total_chars > 0 else 0
+        base_model_name = self._get_base_model_name(credentials)
+        model_entity = self._get_ai_model_entity(
+            base_model_name=base_model_name, model=model
+        )
+        if not model_entity:
+            raise ValueError(f"Base Model Name {base_model_name} is invalid")
+        model_mode = model_entity.entity.model_properties.get(ModelPropertyKey.MODE)
+        if model_mode == LLMMode.CHAT.value:
+            return self._num_tokens_from_messages(credentials, prompt_messages, tools)
+        else:
+            content = prompt_messages[0].content
+            assert isinstance(content, str)
+            return self._num_tokens_from_string(credentials, content)
 
     def validate_credentials(self, model: str, credentials: dict) -> None:
-        """
-        Validate model credentials by ensuring the deployment exists and credentials work.
-        """
-        try:
-            deployment = self._get_deployment_name(model, credentials)
-            self._check_deployment_exists(credentials=credentials, deployment=deployment)
-        except CredentialsValidateFailedError:
-            raise
-        except httpx.HTTPStatusError as exc:
-            logger.exception("HTTP error while validating credentials for model %s", model)
-            raise self._map_http_error(exc, is_validation=True) from exc
-        except httpx.HTTPError as exc:
-            logger.exception("HTTP error while validating credentials for model %s", model)
-            raise CredentialsValidateFailedError(str(exc)) from exc
-        except Exception as ex:
-            logger.exception("Unexpected error while validating credentials for model %s", model)
-            raise CredentialsValidateFailedError(str(ex)) from ex
-
-    # --------------------------------------------------------------------- #
-    # Internal helpers
-    # --------------------------------------------------------------------- #
-
-    def _resolve_llm_config(self, credentials: dict):
+        if "base_model_name" not in credentials:
+            raise CredentialsValidateFailedError("Base Model Name is required")
         base_model_name = self._get_base_model_name(credentials)
-        return resolve_llm_model(base_model_name)
-
-    @staticmethod
-    def _extract_optional_str(credentials: Any, key: str) -> Optional[str]:
-        if not isinstance(credentials, dict):
-            return None
-
-        raw_value = credentials.get(key)
-        if isinstance(raw_value, str) and raw_value.strip():
-            return raw_value.strip()
-
-        nested_candidates = ("model", "model_credentials", "credentials")
-        for nested_key in nested_candidates:
-            nested = credentials.get(nested_key)
-            if isinstance(nested, dict):
-                nested_value = nested.get(key)
-                if isinstance(nested_value, str) and nested_value.strip():
-                    return nested_value.strip()
-        return None
-
-    def _get_api_base(self, credentials: dict) -> str:
-        api_base = credentials.get("api_base")
-        if not isinstance(api_base, str) or not api_base.strip():
-            raise CredentialsValidateFailedError("API base is required.")
-        return api_base.rstrip("/")
-
-    def _get_deployment_name(self, model: str, credentials: dict) -> str:
-        deployment_name = self._extract_optional_str(credentials, "deployment_name")
-        if deployment_name:
-            return deployment_name
-        if not isinstance(model, str) or not model.strip():
-            raise CredentialsValidateFailedError("Model name is required.")
-        return model.strip()
-
-    def _get_base_model_name(self, credentials: dict) -> str:
-        base_model_name = self._extract_optional_str(credentials, "base_model_name")
-        if not base_model_name:
-            raise CredentialsValidateFailedError("Base model name is required.")
-        return base_model_name
-
-    def _build_query_params(self, credentials: dict) -> dict[str, Any]:
-        api_version = credentials.get("api_version") or self.DEFAULT_API_VERSION
-        return {"api-version": api_version}
-
-    def _build_headers(self, credentials: dict) -> dict[str, str]:
-        api_key = credentials.get("api_key")
-        if not isinstance(api_key, str) or not api_key.strip():
-            raise CredentialsValidateFailedError("API key is required.")
-        headers = {
-            "Content-Type": "application/json",
-            "api-key": api_key.strip(),
-        }
-        return headers
-
-    def _build_chat_url(self, api_base: str, deployment: str) -> str:
-        return f"{api_base}/openai/deployments/{deployment}/chat/completions"
-
-    def _select_timeout(self, credentials: dict, stream: bool) -> float:
-        sync_timeout = self._coerce_positive_int(credentials.get("sync_timeout"), self.DEFAULT_SYNC_TIMEOUT)
-        async_timeout = self._coerce_positive_int(credentials.get("async_timeout"), self.DEFAULT_ASYNC_TIMEOUT)
-        if async_timeout < sync_timeout:
-            async_timeout = sync_timeout
-        return float(async_timeout if stream else sync_timeout)
-
-    @staticmethod
-    def _coerce_positive_int(value: Any, default: int) -> int:
-        if value is None or value == "":
-            return default
-        if isinstance(value, bool):
-            return default
+        ai_model_entity = self._get_ai_model_entity(
+            base_model_name=base_model_name, model=model
+        )
+        if not ai_model_entity:
+            raise CredentialsValidateFailedError(
+                f"Base Model Name {credentials['base_model_name']} is invalid"
+            )
         try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            return default
-        return parsed if parsed > 0 else default
+            # Ensure timeout and chunk parameters are valid
+            self._get_timeout_seconds(credentials, "sync_timeout", 30.0)
+            self._get_timeout_seconds(credentials, "async_timeout", 120.0)
+            self._get_non_sse_chunk_count(credentials)
+        except ValueError as exc:
+            raise CredentialsValidateFailedError(str(exc)) from exc
 
-    def _convert_prompt_messages(self, prompt_messages: Sequence[PromptMessage]) -> list[dict[str, Any]]:
-        converted: list[dict[str, Any]] = []
-        for message in prompt_messages:
-            role = message.role.value if isinstance(message.role, PromptMessageRole) else str(message.role)
-            payload: dict[str, Any] = {"role": role.lower()}
-            if message.name:
-                payload["name"] = message.name
-            payload["content"] = self._extract_text(message.content)
-            if isinstance(message, ToolPromptMessage):
-                tool_call_id = getattr(message, "tool_call_id", None)
-                if tool_call_id:
-                    payload["tool_call_id"] = tool_call_id
-            tool_calls = getattr(message, "tool_calls", None)
-            if tool_calls:
-                payload["tool_calls"] = self._convert_tool_calls(tool_calls)
-            converted.append(payload)
-        return converted
+        try:
+            client = AzureOpenAI(**self._to_credential_kwargs(credentials))
+            request_client = client.with_options(timeout=Timeout(15.0))
+            if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
+                request_client.chat.completions.create(
+                    messages=[{"role": "user", "content": "ping"}],
+                    model=model,
+                    temperature=1,
+                    max_completion_tokens=20,
+                    stream=False,
+                )
+            elif (
+                ai_model_entity.entity.model_properties.get(ModelPropertyKey.MODE)
+                == LLMMode.CHAT.value
+            ):
+                request_client.chat.completions.create(
+                    messages=[{"role": "user", "content": "ping"}],
+                    model=model,
+                    temperature=0,
+                    max_tokens=20,
+                    stream=False,
+                )
+            else:
+                request_client.completions.create(
+                    prompt="ping",
+                    model=model,
+                    temperature=0,
+                    max_tokens=20,
+                    stream=False,
+                )
+        except Exception as ex:
+            raise CredentialsValidateFailedError(str(ex))
 
-    def _convert_tool_calls(self, tool_calls: Any) -> list[dict[str, Any]]:
-        converted: list[dict[str, Any]] = []
-        for tool_call in tool_calls or []:
-            if isinstance(tool_call, dict):
-                converted.append(tool_call)
-                continue
-            function = getattr(tool_call, "function", None)
-            converted.append(
-                {
-                    "id": getattr(tool_call, "id", "") or "",
-                    "type": getattr(tool_call, "type", "function") or "function",
-                    "function": {
-                        "name": getattr(function, "name", "") if function else "",
-                        "arguments": getattr(function, "arguments", "") if function else "",
-                    },
-                }
-            )
-        return converted
+    def get_customizable_model_schema(
+        self, model: str, credentials: dict
+    ) -> Optional[AIModelEntity]:
+        base_model_name = self._get_base_model_name(credentials)
+        ai_model_entity = self._get_ai_model_entity(
+            base_model_name=base_model_name, model=model
+        )
+        return ai_model_entity.entity if ai_model_entity else None
 
-    def _convert_tools(self, tools: Optional[list[PromptMessageTool]]) -> Optional[list[dict[str, Any]]]:
-        if not tools:
-            return None
-        converted: list[dict[str, Any]] = []
-        for tool in tools:
-            converted.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    },
-                }
-            )
-        return converted
-
-    def _build_payload(
+    def _generate(
         self,
         model: str,
-        messages: list[dict[str, Any]],
-        model_parameters: dict[str, Any],
-        tools: Optional[list[PromptMessageTool]],
-        stop: Optional[list[str]],
-        stream: bool,
-        user: Optional[str],
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "messages": messages,
-            "model": model,
-            "stream": stream,
-        }
-
-        parameters = {k: v for k, v in (model_parameters or {}).items() if v is not None}
-
-        response_format = parameters.get("response_format")
-        if isinstance(response_format, str):
-            parameters["response_format"] = {"type": response_format}
-
-        payload.update(parameters)
-
-        converted_tools = self._convert_tools(tools)
-        if converted_tools:
-            payload["tools"] = converted_tools
-
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,
+    ) -> Union[LLMResult, Generator]:
+        base_model_name = self._get_base_model_name(credentials)
+        supports_streaming = self._supports_streaming(base_model_name)
+        stream_requested = stream
+        effective_stream = stream_requested and supports_streaming
+        client = AzureOpenAI(**self._to_credential_kwargs(credentials))
+        timeout_seconds = (
+            self._get_timeout_seconds(credentials, "async_timeout", 120.0)
+            if stream_requested
+            else self._get_timeout_seconds(credentials, "sync_timeout", 30.0)
+        )
+        request_client = client.with_options(timeout=Timeout(timeout_seconds))
+        chunk_count = self._get_non_sse_chunk_count(credentials)
+        extra_model_kwargs = {}
         if stop:
-            payload["stop"] = stop
-
+            extra_model_kwargs["stop"] = stop
         if user:
-            payload["user"] = user
+            extra_model_kwargs["user"] = user
 
-        return payload
-
-    def _post_chat(
-        self,
-        url: str,
-        headers: dict[str, str],
-        params: dict[str, Any],
-        payload: dict[str, Any],
-        timeout: float,
-    ) -> dict[str, Any]:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, headers=headers, params=params, json=payload)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                self._handle_http_error(exc, is_validation=False)
-            return response.json()
-
-    def _stream_chat(
-        self,
-        url: str,
-        headers: dict[str, str],
-        params: dict[str, Any],
-        payload: dict[str, Any],
-        timeout: float,
-        model: str,
-        prompt_messages: Sequence[PromptMessage],
-    ) -> Generator[LLMResultChunk, None, None]:
-        def iterator() -> Generator[LLMResultChunk, None, None]:
-            with httpx.Client(timeout=timeout) as client:
-                with client.stream("POST", url, headers=headers, params=params, json=payload) as response:
-                    try:
-                        response.raise_for_status()
-                    except httpx.HTTPStatusError as exc:
-                        self._handle_http_error(exc, is_validation=False)
-                    system_fingerprint: Optional[str] = None
-                    for raw_line in response.iter_lines():
-                        if not raw_line:
-                            continue
-                        line = raw_line.strip()
-                        if not line.startswith("data:"):
-                            continue
-                        data = line[len("data:") :].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(data)
-                        except json.JSONDecodeError:
-                            logger.debug("Unable to decode SSE payload: %s", data)
-                            continue
-                        system_fingerprint = event.get("system_fingerprint", system_fingerprint)
-                        for choice in event.get("choices", []):
-                            yield self._build_chunk_from_event(
-                                event=event,
-                                choice=choice,
-                                model=model,
-                                prompt_messages=prompt_messages,
-                                system_fingerprint=system_fingerprint,
-                            )
-
-        return iterator()
-
-    def _build_chunk_from_event(
-        self,
-        event: dict[str, Any],
-        choice: dict[str, Any],
-        model: str,
-        prompt_messages: Sequence[PromptMessage],
-        system_fingerprint: Optional[str],
-    ) -> LLMResultChunk:
-        delta_dict = choice.get("delta", {})
-        assistant_delta = self._build_assistant_delta(delta_dict)
-        usage = None
-        if choice.get("usage"):
-            usage = self._build_usage(choice["usage"])
-        return LLMResultChunk(
+        # client.completions does not support reasoning_effort
+        if "reasoning_effort" in model_parameters:
+            model_parameters.pop("reasoning_effort")
+        response = request_client.completions.create(
+            prompt=prompt_messages[0].content,
             model=model,
+            stream=effective_stream,
+            **model_parameters,
+            **extra_model_kwargs,
+        )
+
+        if effective_stream:
+            return self._handle_generate_stream_response(
+                model, credentials, response, prompt_messages
+            )
+        block_result = self._handle_generate_response(
+            model, credentials, response, prompt_messages
+        )
+        if stream_requested and not supports_streaming:
+            return self._handle_completion_block_as_stream_response(
+                block_result,
+                prompt_messages,
+                chunk_count=chunk_count,
+            )
+        return block_result
+
+    def _handle_generate_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: Completion,
+        prompt_messages: list[PromptMessage],
+    ):
+        assistant_text = response.choices[0].text
+        assistant_prompt_message = AssistantPromptMessage(content=assistant_text)
+        if response.usage:
+            prompt_tokens = response.usage.prompt_tokens
+            completion_tokens = response.usage.completion_tokens
+        else:
+            content = prompt_messages[0].content
+            assert isinstance(content, str)
+            prompt_tokens = self._num_tokens_from_string(credentials, content)
+            completion_tokens = self._num_tokens_from_string(
+                credentials, assistant_text
+            )
+        usage = self._calc_response_usage(
+            model, credentials, prompt_tokens, completion_tokens
+        )
+        result = LLMResult(
+            model=response.model,
+            prompt_messages=prompt_messages,
+            message=assistant_prompt_message,
+            usage=usage,
+            system_fingerprint=response.system_fingerprint,
+        )
+        return result
+
+    def _handle_completion_block_as_stream_response(
+        self,
+        block_result: LLMResult,
+        prompt_messages: list[PromptMessage],
+        *,
+        chunk_count: int,
+    ) -> Generator[LLMResultChunk, None, None]:
+        text_content = block_result.message.content or ""
+        text = cast(str, text_content)
+        chunks = self._split_text(text, chunk_count)
+        if not chunks:
+            chunks = [""]
+        last_index = len(chunks) - 1
+        for index, chunk_text in enumerate(chunks):
+            is_last = index == last_index
+            chunk_message = AssistantPromptMessage(content=chunk_text)
+            yield LLMResultChunk(
+                model=block_result.model,
+                prompt_messages=prompt_messages,
+                system_fingerprint=block_result.system_fingerprint,
+                delta=LLMResultChunkDelta(
+                    index=index,
+                    message=chunk_message,
+                    finish_reason="stop" if is_last else None,
+                    usage=block_result.usage if is_last else None,
+                ),
+            )
+
+    def _handle_generate_stream_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: Stream[Completion],
+        prompt_messages: list[PromptMessage],
+    ) -> Generator:
+        full_text = ""
+
+        for chunk in response:
+            if len(chunk.choices) == 0:
+                continue
+            delta = chunk.choices[0]
+            if delta.finish_reason is None and (delta.text is None or delta.text == ""):
+                continue
+
+            text = delta.text or ""
+            assistant_prompt_message = AssistantPromptMessage(content=text)
+            full_text += text
+            if delta.finish_reason is not None:
+                if chunk.usage:
+                    prompt_tokens = chunk.usage.prompt_tokens
+                    completion_tokens = chunk.usage.completion_tokens
+                else:
+                    content = prompt_messages[0].content
+                    assert isinstance(content, str)
+                    prompt_tokens = self._num_tokens_from_string(credentials, content)
+                    completion_tokens = self._num_tokens_from_string(
+                        credentials, full_text
+                    )
+                usage = self._calc_response_usage(
+                    model, credentials, prompt_tokens, completion_tokens
+                )
+
+                yield LLMResultChunk(
+                    model=chunk.model,
+                    prompt_messages=prompt_messages,
+                    system_fingerprint=chunk.system_fingerprint,
+                    delta=LLMResultChunkDelta(
+                        index=delta.index,
+                        message=assistant_prompt_message,
+                        finish_reason=delta.finish_reason,
+                        usage=usage,
+                    ),
+                )
+            else:
+                yield LLMResultChunk(
+                    model=chunk.model,
+                    prompt_messages=prompt_messages,
+                    system_fingerprint=chunk.system_fingerprint,
+                    delta=LLMResultChunkDelta(
+                        index=delta.index, message=assistant_prompt_message
+                    ),
+                )
+
+    def _chat_generate(
+        self,
+        model: str,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        tools: Optional[list[PromptMessageTool]] = None,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,
+    ) -> Union[LLMResult, Generator]:
+        base_model_name = self._get_base_model_name(credentials)
+        supports_streaming = self._supports_streaming(base_model_name)
+        stream_requested = stream
+        stream = stream_requested and supports_streaming
+        chunk_count = self._get_non_sse_chunk_count(credentials)
+        client = AzureOpenAI(**self._to_credential_kwargs(credentials))
+        timeout_seconds = (
+            self._get_timeout_seconds(credentials, "async_timeout", 120.0)
+            if stream_requested
+            else self._get_timeout_seconds(credentials, "sync_timeout", 30.0)
+        )
+        request_client = client.with_options(timeout=Timeout(timeout_seconds))
+        response_format = model_parameters.get("response_format")
+        if response_format:
+            if response_format == "json_schema":
+                json_schema = model_parameters.get("json_schema")
+                if not json_schema:
+                    raise ValueError(
+                        "Must define JSON Schema when the response format is json_schema"
+                    )
+                try:
+                    schema = json.loads(json_schema)
+                except Exception:
+                    raise ValueError(f"not correct json_schema format: {json_schema}")
+                model_parameters.pop("json_schema")
+                model_parameters["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": schema,
+                }
+            else:
+                model_parameters["response_format"] = {"type": response_format}
+        elif "json_schema" in model_parameters:
+            del model_parameters["json_schema"]
+        extra_model_kwargs = {}
+        if tools:
+            extra_model_kwargs["tools"] = [
+                PromptMessageFunction(function=tool).model_dump(mode="json")
+                for tool in tools
+            ]
+        if stop:
+            extra_model_kwargs["stop"] = stop
+        if user:
+            extra_model_kwargs["user"] = user
+        if stream:
+            extra_model_kwargs["stream_options"] = {"include_usage": True}
+        prompt_messages = self._clear_illegal_prompt_messages(
+            base_model_name, prompt_messages
+        )
+        block_as_stream = False
+        if stream_requested and not supports_streaming:
+            block_as_stream = True
+            stream = False
+            if "stream_options" in extra_model_kwargs:
+                del extra_model_kwargs["stream_options"]
+        if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
+            # o1 and o1-* do not support streaming
+            # https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/reasoning#api--feature-support
+            if base_model_name.startswith("o1"):
+                if stream:
+                    block_as_stream = True
+                    stream = False
+                    if "stream_options" in extra_model_kwargs:
+                        del extra_model_kwargs["stream_options"]
+            if "stop" in extra_model_kwargs:
+                del extra_model_kwargs["stop"]
+
+        messages: Any = [self._convert_prompt_message_to_dict(m) for m in prompt_messages]
+        response = request_client.chat.completions.create(
+            messages=messages,
+            model=model,
+            stream=stream,
+            **model_parameters,
+            **extra_model_kwargs,
+        )
+
+        if stream:
+            return self._handle_chat_generate_stream_response(
+                model, credentials, response, prompt_messages, tools
+            )
+        block_result = self._handle_chat_generate_response(
+            model, credentials, response, prompt_messages, tools
+        )
+        if block_as_stream:
+            return self._handle_chat_block_as_stream_response(
+                block_result,
+                prompt_messages,
+                stop,
+                chunk_count=chunk_count,
+            )
+
+        return block_result
+
+    def _handle_chat_block_as_stream_response(
+        self,
+        block_result: LLMResult,
+        prompt_messages: list[PromptMessage],
+        stop: Optional[list[str]] = None,
+        *,
+        chunk_count: int,
+    ) -> Generator[LLMResultChunk, None, None]:
+        """
+        Handle llm chat response
+
+        :param model: model name
+        :param credentials: credentials
+        :param response: response
+        :param prompt_messages: prompt messages
+        :param tools: tools for tool calling
+        :param stop: stop words
+        :return: llm response chunk generator
+        """
+        text_content = block_result.message.content or ""
+        text = cast(str, text_content)
+        if stop:
+            text = self.enforce_stop_tokens(text, stop)
+        message = block_result.message
+        chunks = self._split_text(text, chunk_count)
+        if not chunks:
+            chunks = [""]
+        last_index = len(chunks) - 1
+        for index, chunk_text in enumerate(chunks):
+            is_last = index == last_index
+            chunk_message = AssistantPromptMessage(
+                content=chunk_text,
+                name=message.name,
+                tool_calls=message.tool_calls if is_last else None,
+            )
+            yield LLMResultChunk(
+                model=block_result.model,
+                prompt_messages=prompt_messages,
+                system_fingerprint=block_result.system_fingerprint,
+                delta=LLMResultChunkDelta(
+                    index=index,
+                    message=chunk_message,
+                    finish_reason="stop" if is_last else None,
+                    usage=block_result.usage if is_last else None,
+                ),
+            )
+
+    @staticmethod
+    def _split_text(text: str, chunk_count: int) -> list[str]:
+        if chunk_count <= 1:
+            return [text]
+        if not text:
+            return [""]
+        stride = max(1, math.ceil(len(text) / chunk_count))
+        return [text[i : i + stride] for i in range(0, len(text), stride)]
+
+    def _clear_illegal_prompt_messages(
+        self, model: str, prompt_messages: list[PromptMessage]
+    ) -> list[PromptMessage]:
+        """
+        Clear illegal prompt messages for OpenAI API
+
+        :param model: model name
+        :param prompt_messages: prompt messages
+        :return: cleaned prompt messages
+        """
+        checklist = ["gpt-4-turbo", "gpt-4-turbo-2024-04-09"]
+        if model in checklist:
+            user_message_count = len(
+                [m for m in prompt_messages if isinstance(m, UserPromptMessage)]
+            )
+            if user_message_count > 1:
+                for prompt_message in prompt_messages:
+                    if isinstance(prompt_message, UserPromptMessage):
+                        if isinstance(prompt_message.content, list):
+                            prompt_message.content = "\n".join(
+                                [
+                                    item.data
+                                    if item.type == PromptMessageContentType.TEXT
+                                    else "[IMAGE]"
+                                    if item.type == PromptMessageContentType.IMAGE
+                                    else ""
+                                    for item in prompt_message.content
+                                ]
+                            )
+        if model.startswith(("o1", "o3", "o4")):
+            system_message_count = len(
+                [m for m in prompt_messages if isinstance(m, SystemPromptMessage)]
+            )
+            if system_message_count > 0:
+                new_prompt_messages = []
+                for prompt_message in prompt_messages:
+                    if isinstance(prompt_message, SystemPromptMessage):
+                        prompt_message = UserPromptMessage(
+                            content=prompt_message.content, name=prompt_message.name
+                        )
+                    new_prompt_messages.append(prompt_message)
+                prompt_messages = new_prompt_messages
+        return prompt_messages
+
+    def _handle_chat_generate_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: ChatCompletion,
+        prompt_messages: list[PromptMessage],
+        tools: Optional[list[PromptMessageTool]] = None,
+    ):
+        assistant_message = response.choices[0].message
+        assistant_message_tool_calls = assistant_message.tool_calls
+        tool_calls = []
+        self._update_tool_calls(
+            tool_calls=tool_calls, tool_calls_response=assistant_message_tool_calls
+        )
+        content = ""
+        if hasattr(assistant_message, "model_extra") and assistant_message.model_extra.get("reasoning_content"):
+            content += "<think>\n" + assistant_message.model_extra["reasoning_content"] + "\n</think>"
+        content += assistant_message.content
+
+        assistant_prompt_message = AssistantPromptMessage(
+            content=content, tool_calls=tool_calls
+        )
+        if response.usage:
+            prompt_tokens = response.usage.prompt_tokens
+            completion_tokens = response.usage.completion_tokens
+        else:
+            prompt_tokens = self._num_tokens_from_messages(
+                credentials, prompt_messages, tools
+            )
+            completion_tokens = self._num_tokens_from_messages(
+                credentials, [assistant_prompt_message]
+            )
+        usage = self._calc_response_usage(
+            model, credentials, prompt_tokens, completion_tokens
+        )
+        result = LLMResult(
+            model=response.model or model,
+            prompt_messages=prompt_messages,
+            message=assistant_prompt_message,
+            usage=usage,
+            system_fingerprint=response.system_fingerprint,
+        )
+        return result
+
+    def _handle_chat_generate_stream_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: Stream[ChatCompletionChunk],
+        prompt_messages: list[PromptMessage],
+        tools: Optional[list[PromptMessageTool]] = None,
+    ):
+        is_reasoning = False
+        index = 0
+        real_model = model
+        system_fingerprint = None
+        completion = ""
+        tool_calls = []
+        prompt_tokens = 0
+        completion_tokens = 0
+        has_usage = False
+        for chunk in response:
+            if len(chunk.choices) == 0:
+                if chunk.usage:
+                    prompt_tokens = chunk.usage.prompt_tokens
+                    completion_tokens = chunk.usage.completion_tokens
+                    has_usage = True
+                continue
+            delta = chunk.choices[0]
+            if delta.delta is None:
+                continue
+            self._update_tool_calls(
+                tool_calls=tool_calls, tool_calls_response=delta.delta.tool_calls
+            )
+            if (
+                delta.finish_reason is None
+                and not delta.delta.content
+                and not hasattr(delta.delta, "reasoning_content")
+            ):
+                continue
+            content, is_reasoning = self._azure_wrap_thinking_by_reasoning_content(
+                delta.delta, is_reasoning
+            )
+            assistant_prompt_message = AssistantPromptMessage(
+                content=content, tool_calls=tool_calls
+            )
+            real_model = chunk.model
+            system_fingerprint = chunk.system_fingerprint
+            completion += content
+            yield LLMResultChunk(
+                model=real_model,
+                prompt_messages=prompt_messages,
+                system_fingerprint=system_fingerprint,
+                delta=LLMResultChunkDelta(
+                    index=index, message=assistant_prompt_message
+                ),
+            )
+            index += 1
+        if not has_usage:
+            prompt_tokens = self._num_tokens_from_messages(
+                credentials, prompt_messages, tools
+            )
+            full_assistant_prompt_message = AssistantPromptMessage(content=completion)
+            completion_tokens = self._num_tokens_from_messages(
+                credentials, [full_assistant_prompt_message]
+            )
+        usage = self._calc_response_usage(
+            model, credentials, prompt_tokens, completion_tokens
+        )
+
+        yield LLMResultChunk(
+            model=real_model,
             prompt_messages=prompt_messages,
             system_fingerprint=system_fingerprint,
             delta=LLMResultChunkDelta(
-                index=choice.get("index", 0),
-                message=assistant_delta,
+                index=index,
+                message=AssistantPromptMessage(content=""),
+                finish_reason="stop",
                 usage=usage,
-                finish_reason=choice.get("finish_reason"),
             ),
         )
 
-    def _build_assistant_delta(self, delta: dict[str, Any]) -> AssistantPromptMessage:
-        content = self._extract_text(delta.get("content"))
-        tool_calls = self._convert_tool_calls(delta.get("tool_calls"))
-        return AssistantPromptMessage(
-            content=content,
-            tool_calls=tool_calls,
-        )
-
-    def _build_llm_result_from_response(
-        self,
-        response: dict[str, Any],
-        model: str,
-        prompt_messages: Sequence[PromptMessage],
-    ) -> LLMResult:
-        choices = response.get("choices", [])
-        if not choices:
-            raise CredentialsValidateFailedError("Empty response received from model.")
-        primary_choice = choices[0]
-        assistant_message, reasoning_content = self._build_assistant_message_from_choice(primary_choice)
-        usage = self._build_usage(response.get("usage"))
-        return LLMResult(
-            id=response.get("id"),
-            model=model,
-            prompt_messages=prompt_messages,
-            message=assistant_message,
-            usage=usage,
-            system_fingerprint=response.get("system_fingerprint"),
-            reasoning_content=reasoning_content,
-        )
-
-    def _build_assistant_message_from_choice(
-        self, choice: dict[str, Any]
-    ) -> tuple[AssistantPromptMessage, Optional[str]]:
-        message = choice.get("message", {}) or {}
-        content = self._extract_text(message.get("content"))
-        tool_calls = self._convert_tool_calls(message.get("tool_calls"))
-        reasoning_content = self._extract_text(message.get("reasoning_content"))
-        return (
-            AssistantPromptMessage(
-                content=content,
-                tool_calls=tool_calls,
-            ),
-            reasoning_content if reasoning_content else None,
-        )
-
-    def _build_usage(self, usage_dict: Any) -> LLMUsage:
-        if not isinstance(usage_dict, dict):
-            return LLMUsage.empty_usage()
-        metadata = {
-            "prompt_tokens": usage_dict.get("prompt_tokens", 0),
-            "completion_tokens": usage_dict.get("completion_tokens", 0),
-            "total_tokens": usage_dict.get("total_tokens", 0),
-        }
-        try:
-            return LLMUsage.from_metadata(metadata)
-        except AttributeError:
-            # Older SDK versions may not expose from_metadata
-            usage = LLMUsage.empty_usage()
-            return usage.model_copy(
-                update={
-                    "prompt_tokens": metadata["prompt_tokens"],
-                    "completion_tokens": metadata["completion_tokens"],
-                    "total_tokens": metadata["total_tokens"],
-                }
-            )
-
-    def _to_stream_from_completion(
-        self,
-        response: dict[str, Any],
-        model: str,
-        prompt_messages: Sequence[PromptMessage],
-        credentials: dict,
-    ) -> Generator[LLMResultChunk, None, None]:
-        choices = response.get("choices", [])
-        if not choices:
-            raise CredentialsValidateFailedError("Empty response received from model.")
-        primary_choice = choices[0]
-        assistant_message, reasoning_content = self._build_assistant_message_from_choice(primary_choice)
-        usage = self._build_usage(response.get("usage"))
-        finish_reason = primary_choice.get("finish_reason")
-        system_fingerprint = response.get("system_fingerprint")
-        split_count = self._get_non_sse_chunk_count(credentials)
-        segments = self._split_content(assistant_message.content, split_count)
-
-        def iterator() -> Generator[LLMResultChunk, None, None]:
-            for idx, segment in enumerate(segments):
-                is_last = idx == len(segments) - 1
-                message = AssistantPromptMessage(
-                    content=segment,
-                    tool_calls=assistant_message.tool_calls if is_last else [],
-                )
-                usage_payload = usage if is_last else None
-                reasoning = reasoning_content if is_last else None
-                yield LLMResultChunk(
-                    model=model,
-                    prompt_messages=prompt_messages,
-                    system_fingerprint=system_fingerprint,
-                    delta=LLMResultChunkDelta(
-                        index=0,
-                        message=message,
-                        usage=usage_payload,
-                        finish_reason=finish_reason if is_last else None,
-                    ),
-                )
-                if reasoning and not segment:
-                    # emit reasoning content if no textual segment in final chunk
-                    yield LLMResultChunk(
-                        model=model,
-                        prompt_messages=prompt_messages,
-                        system_fingerprint=system_fingerprint,
-                        delta=LLMResultChunkDelta(
-                            index=0,
-                            message=AssistantPromptMessage(content=reasoning, tool_calls=[]),
-                            usage=None,
-                            finish_reason=finish_reason,
-                        ),
+    @staticmethod
+    def _update_tool_calls(
+        tool_calls: list[AssistantPromptMessage.ToolCall],
+        tool_calls_response: Optional[
+            Sequence[ChatCompletionMessageToolCall | ChoiceDeltaToolCall]
+        ],
+    ) -> None:
+        if tool_calls_response:
+            for response_tool_call in tool_calls_response:
+                if isinstance(response_tool_call, ChatCompletionMessageToolCall):
+                    function = AssistantPromptMessage.ToolCall.ToolCallFunction(
+                        name=response_tool_call.function.name,
+                        arguments=response_tool_call.function.arguments,
                     )
-
-        return iterator()
-
-    def _get_non_sse_chunk_count(self, credentials: dict) -> int:
-        return self._coerce_positive_int(credentials.get("non_sse_chunk_count"), self.DEFAULT_NON_SSE_CHUNK)
-
-    @staticmethod
-    def _split_content(text: str, parts: int) -> list[str]:
-        if parts <= 1 or not text:
-            return [text] if text else [""]
-        step = max(1, math.ceil(len(text) / parts))
-        segments = [text[i : i + step] for i in range(0, len(text), step)]
-        return segments or [""]
-
-    @staticmethod
-    def _extract_text(content: Any) -> Any:
-        if content is None:
-            return ""
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            text_parts: list[str] = []
-            multimodal_parts: list[dict[str, Any]] = []
-            for item in content:
-                if isinstance(item, dict):
-                    item_type = item.get("type")
-                    if item_type in {"text", "reasoning"}:
-                        text_parts.append(item.get("text", ""))
+                    tool_call = AssistantPromptMessage.ToolCall(
+                        id=response_tool_call.id,
+                        type=response_tool_call.type,
+                        function=function,
+                    )
+                    tool_calls.append(tool_call)
+                elif isinstance(response_tool_call, ChoiceDeltaToolCall):
+                    index = response_tool_call.index
+                    if index < len(tool_calls):
+                        tool_calls[index].id = (
+                            response_tool_call.id or tool_calls[index].id
+                        )
+                        tool_calls[index].type = (
+                            response_tool_call.type or tool_calls[index].type
+                        )
+                        if response_tool_call.function:
+                            tool_calls[index].function.name = (
+                                response_tool_call.function.name
+                                or tool_calls[index].function.name
+                            )
+                            tool_calls[index].function.arguments += (
+                                response_tool_call.function.arguments or ""
+                            )
                     else:
-                        multimodal_parts.append(item)
-                elif hasattr(item, "data"):
-                    item_type = getattr(item, "type", None)
-                    if item_type == PromptMessageContentType.TEXT:
-                        text_parts.append(getattr(item, "data", ""))
-                    elif item_type == PromptMessageContentType.IMAGE:
-                        data = getattr(item, "data", "")
-                        if data:
-                            multimodal_parts.append({"type": "image_url", "image_url": {"url": data}})
-                    else:
-                        text_parts.append(getattr(item, "data", ""))
-            if multimodal_parts:
-                if text_parts:
-                    multimodal_parts.insert(0, {"type": "text", "text": "".join(text_parts)})
-                return multimodal_parts
-            return "".join(text_parts)
-        return str(content)
-
-    def _handle_http_error(self, exc: httpx.HTTPStatusError, is_validation: bool) -> None:
-        raise self._map_http_error(exc, is_validation)
-
-    def _map_http_error(self, exc: httpx.HTTPStatusError, is_validation: bool) -> Exception:
-        status = exc.response.status_code
-        message = self._extract_error_message(exc.response)
-        logger.error("Provider request failed with status %s: %s", status, message)
-
-        # Treat authentication/authorization failures as credential issues when validating.
-        if status in {401, 403}:
-            if is_validation:
-                return CredentialsValidateFailedError(f"Authentication failed ({status}): {message}")
-            return InvokeAuthorizationError(f"Authentication failed ({status}): {message}")
-
-        # During validation, propagate other HTTP errors as credential validation issues.
-        if is_validation:
-            return CredentialsValidateFailedError(f"Provider request failed ({status}): {message}")
-
-        if status == 429:
-            return InvokeRateLimitError(f"Provider request failed ({status}): {message}")
-        if status >= 500:
-            return InvokeServerUnavailableError(f"Provider request failed ({status}): {message}")
-        if status in {400, 404, 422}:
-            return InvokeBadRequestError(f"Provider request failed ({status}): {message}")
-
-        return InvokeError(f"Provider request failed ({status}): {message}")
-
-    @property
-    def _invoke_error_mapping(self) -> dict[type[InvokeError], list[type[Exception]]]:
-        return {
-            InvokeAuthorizationError: [InvokeAuthorizationError],
-            InvokeRateLimitError: [InvokeRateLimitError],
-            InvokeServerUnavailableError: [InvokeServerUnavailableError, httpx.TimeoutException, httpx.ConnectError],
-            InvokeBadRequestError: [InvokeBadRequestError],
-            InvokeConnectionError: [InvokeConnectionError, httpx.TransportError],
-            ValueError: [ValueError],
-            InvokeError: [InvokeError, Exception],
-        }
+                        assert response_tool_call.id is not None
+                        assert response_tool_call.type is not None
+                        assert response_tool_call.function is not None
+                        assert response_tool_call.function.name is not None
+                        assert response_tool_call.function.arguments is not None
+                        function = AssistantPromptMessage.ToolCall.ToolCallFunction(
+                            name=response_tool_call.function.name,
+                            arguments=response_tool_call.function.arguments,
+                        )
+                        tool_call = AssistantPromptMessage.ToolCall(
+                            id=response_tool_call.id,
+                            type=response_tool_call.type,
+                            function=function,
+                        )
+                        tool_calls.append(tool_call)
 
     @staticmethod
-    def _extract_error_message(response: httpx.Response) -> str:
-        try:
-            payload = response.json()
-            if isinstance(payload, dict):
-                if "error" in payload and isinstance(payload["error"], dict):
-                    return payload["error"].get("message") or json.dumps(payload["error"])
-                return json.dumps(payload)
-        except Exception:
-            pass
-        return response.text
-
-    def _check_deployment_exists(self, credentials: dict, deployment: str) -> None:
-        api_base = self._get_api_base(credentials)
-        headers = self._build_headers(credentials)
-        params = self._build_query_params(credentials)
-        url = f"{api_base}/openai/deployments"
-        timeout = self._select_timeout(credentials, stream=False)
-        with httpx.Client(timeout=timeout) as client:
-            response = client.get(url, headers=headers, params=params)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                self._handle_http_error(exc, is_validation=True)
-            try:
-                data = response.json()
-            except ValueError as exc:
-                raise CredentialsValidateFailedError("Invalid JSON response while validating deployment.") from exc
-
-        deployments = data.get("data") if isinstance(data, dict) else None
-        if deployments is None and isinstance(data, dict):
-            deployments = data.get("value")
-
-        if isinstance(deployments, list) and deployments:
-            names = {
-                item.get("id") or item.get("name")
-                for item in deployments
-                if isinstance(item, dict)
+    def _convert_prompt_message_to_dict(message: PromptMessage):
+        if isinstance(message, UserPromptMessage):
+            message = cast(UserPromptMessage, message)
+            if isinstance(message.content, str):
+                message_dict = {"role": "user", "content": message.content}
+            else:
+                sub_messages = []
+                assert message.content is not None
+                for message_content in message.content:
+                    if message_content.type == PromptMessageContentType.TEXT:
+                        message_content = cast(
+                            TextPromptMessageContent, message_content
+                        )
+                        sub_message_dict = {
+                            "type": "text",
+                            "text": message_content.data,
+                        }
+                        sub_messages.append(sub_message_dict)
+                    elif message_content.type == PromptMessageContentType.IMAGE:
+                        message_content = cast(
+                            ImagePromptMessageContent, message_content
+                        )
+                        sub_message_dict = {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": message_content.data,
+                                "detail": message_content.detail.value,
+                            },
+                        }
+                        sub_messages.append(sub_message_dict)
+                    elif message_content.type == PromptMessageContentType.AUDIO:
+                        message_content = cast(
+                            AudioPromptMessageContent, message_content
+                        )
+                        sub_message_dict = {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": message_content.base64_data,
+                                "format": message_content.format,
+                            },
+                        }
+                        sub_messages.append(sub_message_dict)
+                message_dict = {"role": "user", "content": sub_messages}
+        elif isinstance(message, AssistantPromptMessage):
+            message_dict = {"role": "assistant", "content": message.content}
+            if message.tool_calls:
+                message_dict["tool_calls"] = [
+                    tool_call.model_dump(mode="json")
+                    for tool_call in message.tool_calls
+                ]
+        elif isinstance(message, SystemPromptMessage):
+            message = cast(SystemPromptMessage, message)
+            message_dict = {"role": "system", "content": message.content}
+        elif isinstance(message, ToolPromptMessage):
+            message = cast(ToolPromptMessage, message)
+            message_dict = {
+                "role": "tool",
+                "name": message.name,
+                "content": message.content,
+                "tool_call_id": message.tool_call_id,
             }
-            if names and deployment not in names:
-                raise CredentialsValidateFailedError(
-                    f"Deployment '{deployment}' not found. Available deployments: {', '.join(sorted(names))}"
-                )
+        else:
+            raise ValueError(f"Got unknown type {message}")
+        if message.name:
+            message_dict["name"] = message.name
+        return message_dict
 
-    def get_customizable_model_schema(self, model: str, credentials: dict) -> Optional[AIModelEntity]:
-        config = self._resolve_llm_config(credentials)
-        return config.clone_with_deployment(model)
+    def _num_tokens_from_string(
+        self,
+        credentials: dict,
+        text: str,
+        tools: Optional[list[PromptMessageTool]] = None,
+    ) -> int:
+        try:
+            encoding = tiktoken.encoding_for_model(credentials["base_model_name"])
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+        num_tokens = len(encoding.encode(text))
+        if tools:
+            num_tokens += self._num_tokens_for_tools(encoding, tools)
+        return num_tokens
+
+    def _num_tokens_from_messages(
+        self,
+        credentials: dict,
+        messages: list[PromptMessage],
+        tools: Optional[list[PromptMessageTool]] = None,
+    ) -> int:
+        """Calculate num tokens for gpt-3.5-turbo and gpt-4 with tiktoken package.
+
+        Official documentation: https://github.com/openai/openai-cookbook/blob/
+        main/examples/How_to_format_inputs_to_ChatGPT_models.ipynb"""
+        model = credentials["base_model_name"]
+        if model.startswith(("o1", "o3", "o4", "gpt-4.1", "gpt-4.5", "gpt-5")):
+            model = "gpt-4o"
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            logger.warning("Warning: model not found. Using cl100k_base encoding.")
+            encoding_name = "cl100k_base"
+            encoding = tiktoken.get_encoding(encoding_name)
+        if model.startswith("gpt-35-turbo-0301"):
+            tokens_per_message = 4
+            tokens_per_name = -1
+        elif (
+            model.startswith("gpt-35-turbo")
+            or model.startswith("gpt-4")
+            or model.startswith(("o1", "o3", "o4"))
+            or model.startswith("grok")
+        ):
+            tokens_per_message = 3
+            tokens_per_name = 1
+        else:
+            raise NotImplementedError(
+                f"get_num_tokens_from_messages() is not presently implemented for model {model}.See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens."
+            )
+        num_tokens = 0
+        messages_dict = [self._convert_prompt_message_to_dict(m) for m in messages]
+        image_details: list[dict] = []
+        for message in messages_dict:
+            num_tokens += tokens_per_message
+            for key, value in message.items():
+                if isinstance(value, list):
+                    text = ""
+                    for item in value:
+                        if isinstance(item, dict):
+                            if item["type"] == "text":
+                                text += item["text"]
+                            elif item["type"] == "image_url":
+                                image_details.append(item["image_url"])
+                    value = text
+                if key == "tool_calls":
+                    for tool_call in value:
+                        assert isinstance(tool_call, dict)
+                        for t_key, t_value in tool_call.items():
+                            num_tokens += len(encoding.encode(t_key))
+                            if t_key == "function":
+                                for f_key, f_value in t_value.items():
+                                    num_tokens += len(encoding.encode(f_key))
+                                    num_tokens += len(encoding.encode(f_value))
+                            else:
+                                num_tokens += len(encoding.encode(t_key))
+                                num_tokens += len(encoding.encode(t_value))
+                else:
+                    num_tokens += len(encoding.encode(str(value)))
+                if key == "name":
+                    num_tokens += tokens_per_name
+        num_tokens += 3
+        if tools:
+            num_tokens += self._num_tokens_for_tools(encoding, tools)
+        if len(image_details) > 0:
+            num_tokens += self._num_tokens_from_images(
+                image_details=image_details,
+                base_model_name=credentials["base_model_name"],
+            )
+        return num_tokens
+
+    @staticmethod
+    def _num_tokens_for_tools(
+        encoding: tiktoken.Encoding, tools: list[PromptMessageTool]
+    ) -> int:
+        num_tokens = 0
+        for tool in tools:
+            num_tokens += len(encoding.encode("type"))
+            num_tokens += len(encoding.encode("function"))
+            num_tokens += len(encoding.encode("name"))
+            num_tokens += len(encoding.encode(tool.name))
+            num_tokens += len(encoding.encode("description"))
+            num_tokens += len(encoding.encode(tool.description))
+            parameters = tool.parameters
+            num_tokens += len(encoding.encode("parameters"))
+            if "title" in parameters:
+                num_tokens += len(encoding.encode("title"))
+                num_tokens += len(encoding.encode(parameters["title"]))
+            num_tokens += len(encoding.encode("type"))
+            num_tokens += len(encoding.encode(parameters["type"]))
+            if "properties" in parameters:
+                num_tokens += len(encoding.encode("properties"))
+                for key, value in parameters["properties"].items():
+                    num_tokens += len(encoding.encode(key))
+                    for field_key, field_value in value.items():
+                        num_tokens += len(encoding.encode(field_key))
+                        if field_key == "enum":
+                            for enum_field in field_value:
+                                num_tokens += 3
+                                num_tokens += len(encoding.encode(enum_field))
+                        else:
+                            num_tokens += len(encoding.encode(field_key))
+                            num_tokens += len(encoding.encode(str(field_value)))
+            if "required" in parameters:
+                num_tokens += len(encoding.encode("required"))
+                for required_field in parameters["required"]:
+                    num_tokens += 3
+                    num_tokens += len(encoding.encode(required_field))
+        return num_tokens
+
+    @staticmethod
+    def _get_ai_model_entity(base_model_name: str, model: str):
+        for ai_model_entity in LLM_BASE_MODELS:
+            if ai_model_entity.base_model_name == base_model_name:
+                ai_model_entity_copy = copy.deepcopy(ai_model_entity)
+                ai_model_entity_copy.entity.model = model
+                ai_model_entity_copy.entity.label.en_US = model
+                ai_model_entity_copy.entity.label.zh_Hans = model
+                if hasattr(ai_model_entity_copy.entity.label, "ja_JP"):
+                    ai_model_entity_copy.entity.label.ja_JP = model
+                return ai_model_entity_copy
+
+    def _get_base_model_name(self, credentials: dict) -> str:
+        base_model_name = credentials.get("base_model_name")
+        if not base_model_name:
+            raise ValueError("Base Model Name is required")
+        return base_model_name
+
+    def _supports_streaming(self, base_model_name: str) -> bool:
+        base_model = get_llm_base_model(base_model_name)
+        if not base_model:
+            return True
+        return base_model.supports_streaming
+
+    @staticmethod
+    def _get_non_sse_chunk_count(credentials: dict) -> int:
+        raw_value = credentials.get("non_sse_chunk_count")
+        if raw_value in (None, ""):
+            return 4
+        if isinstance(raw_value, bool):
+            raise ValueError("non_sse_chunk_count must be a positive integer.")
+        if isinstance(raw_value, int):
+            value = raw_value
+        elif isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+            if not raw_value:
+                return 4
+            if not raw_value.isdigit():
+                raise ValueError("non_sse_chunk_count must be a positive integer.")
+            value = int(raw_value)
+        else:
+            raise ValueError("non_sse_chunk_count must be a positive integer.")
+        if value <= 0:
+            raise ValueError("non_sse_chunk_count must be a positive integer.")
+        return value
+
+    def _get_image_patches(self, n: int) -> float:
+        return (n + 32 - 1) // 32
+
+    # This algorithm is based on https://platform.openai.com/docs/guides/images-vision?api-mode=chat#calculating-costs
+    def _num_tokens_from_images(
+        self, base_model_name: str, image_details: list[dict]
+    ) -> int:
+        num_tokens: int = 0
+        base_tokens: int = 0
+        tile_tokens: int = 0
+
+        if base_model_name.startswith("gpt-4o-mini"):
+            base_tokens = 2833
+            tile_tokens = 5667
+        elif base_model_name.startswith(("gpt-4o", "gpt-4.1", "gpt-4.5")):
+            base_tokens = 85
+            tile_tokens = 170
+        elif base_model_name.startswith(("o1", "o3", "o1-pro")):
+            base_tokens = 75
+            tile_tokens = 150
+
+        for image_detail in image_details:
+            base64_str = image_detail["url"].split(",")[1]
+
+            image_data = base64.b64decode(base64_str)
+            image = Image.open(io.BytesIO(image_data))
+            width, height = image.size
+
+            if base_model_name.startswith(("gpt-4.1-mini", "gpt-4.1-nano", "o4-mini")):
+                width_patches = self._get_image_patches(width)
+                height_patches = self._get_image_patches(height)
+                cap = 1536
+
+                tokens = width_patches * height_patches
+
+                if tokens > cap:
+                    shrink_factor = math.sqrt(cap * 32 ** 2 / (width * height))
+
+                    new_width = width * shrink_factor
+                    new_height = height * shrink_factor
+
+                    w_patches = int(new_width / 32)
+                    h_patches = int(new_height / 32)
+
+                    tokens = w_patches * h_patches
+
+                if base_model_name.startswith("o4-mini"):
+                    num_tokens += int(tokens * 1.72)
+                elif base_model_name.startswith("gpt-4.1-nano"):
+                    num_tokens += int(tokens * 2.46)
+                elif base_model_name.startswith("gpt-4.1-mini"):
+                    num_tokens += int(tokens * 1.62)
+            else:
+                if image_detail["detail"] == "low":
+                    # Regardless of input size, low detail images are a fixed cost.
+                    num_tokens += 85
+                else:
+                    # Scale the image longest side to 2048px
+                    if width > 2048 or height > 2048:
+                        aspect_ratio = width / height
+                        if aspect_ratio > 1:
+                            width, height = 2048, int(2048 / aspect_ratio)
+                        else:
+                            width, height = int(2048 * aspect_ratio), 2048
+
+                    # Further scale the image shortest side to 768px
+                    if width >= height and height > 768:
+                        width, height = int((768 / height) * width), 768
+                    elif height > width and width > 768:
+                        width, height = 768, int((768 / width) * height)
+
+                    # Calculate the number of tiles
+                    w_tiles = math.ceil(width / 512)
+                    h_tiles = math.ceil(height / 512)
+                    total_tiles = w_tiles * h_tiles
+
+                    num_tokens += base_tokens + total_tiles * tile_tokens
+
+        return num_tokens
+
+    @staticmethod
+    def _azure_wrap_thinking_by_reasoning_content(
+        delta: ChoiceDelta,
+        is_reasoning: bool
+    ) -> tuple[str, bool]:
+        """
+        If the reasoning response is from delta.get("reasoning_content"), we wrap
+        it with HTML think tag.
+        :param delta: delta dictionary from LLM streaming response
+        :param is_reasoning: is reasoning
+        :return: tuple of (processed_content, is_reasoning)
+        """
+
+        content = delta.content or ""
+        reasoning_content = delta.reasoning_content if hasattr(delta, "reasoning_content") else ""
+        try:
+            if reasoning_content:
+                try:
+                    if not is_reasoning:
+                        content = "<think>\n" + reasoning_content
+                        is_reasoning = True
+                    else:
+                        content = reasoning_content
+                except Exception as ex:
+                    raise ValueError(f"[_azure_wrap_thinking_by_reasoning_content-1] {ex}") from ex
+            elif is_reasoning and content:
+                content = "\n</think>" + content
+                is_reasoning = False
+        except Exception as ex:
+            raise ValueError(f"[_azure_wrap_thinking_by_reasoning_content-2] {ex}") from ex
+        return content, is_reasoning

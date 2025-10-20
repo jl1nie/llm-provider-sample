@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass
-from decimal import Decimal
-from typing import Dict
+from pydantic import BaseModel
 
 from dify_plugin.entities.model import (
+    PARAMETER_RULE_TEMPLATE,
     AIModelEntity,
     DefaultParameterName,
     FetchFrom,
@@ -14,11 +12,11 @@ from dify_plugin.entities.model import (
     ModelPropertyKey,
     ModelType,
     ParameterRule,
-    PARAMETER_RULE_TEMPLATE,
     PriceConfig,
 )
-from dify_plugin.errors.model import CredentialsValidateFailedError
 from dify_plugin.entities.model.llm import LLMMode
+
+AZURE_OPENAI_API_VERSION = "2024-02-15-preview"
 
 
 def _temperature_rule() -> ParameterRule:
@@ -49,9 +47,9 @@ def _frequency_penalty_rule() -> ParameterRule:
     )
 
 
-def _max_tokens_rule(default: int, minimum: int, maximum: int, *, field_name: str = "max_tokens") -> ParameterRule:
+def _max_tokens_rule(default: int, minimum: int, maximum: int) -> ParameterRule:
     rule = ParameterRule(
-        name=field_name,
+        name="max_tokens",
         **PARAMETER_RULE_TEMPLATE[DefaultParameterName.MAX_TOKENS],
     )
     rule.default = default
@@ -67,31 +65,58 @@ def _response_format_rule() -> ParameterRule:
     )
 
 
-@dataclass(frozen=True)
-class LlmModelConfig:
+class AzureBaseModel(BaseModel):
     base_model_name: str
     entity: AIModelEntity
-    supports_sse: bool
-
-    def clone_with_deployment(self, deployment: str) -> AIModelEntity:
-        entity_copy = deepcopy(self.entity)
-        entity_copy.model = deployment
-        if entity_copy.label is None:
-            entity_copy.label = I18nObject(en_US=deployment)
-        else:
-            for attr in ("en_US", "zh_Hans", "ja_JP"):
-                if hasattr(entity_copy.label, attr):
-                    setattr(entity_copy.label, attr, deployment)
-        return entity_copy
+    supports_streaming: bool = True
 
 
-LLM_MODELS: Dict[str, LlmModelConfig] = {
-    "openai4.1": LlmModelConfig(
-        base_model_name="openai4.1",
-        supports_sse=True,
+LLM_BASE_MODELS = [
+    AzureBaseModel(
+        base_model_name="claude-v4sonnet",
+        supports_streaming=False,
         entity=AIModelEntity(
-            model="openai4.1",
-            label=I18nObject(en_US="openai4.1", zh_Hans="openai4.1", ja_JP="openai4.1"),
+            model="fake-deployment-name",
+            label=I18nObject(
+                en_US="claude-v4sonnet",
+                zh_Hans="claude-v4sonnet",
+                ja_JP="claude-v4sonnet",
+            ),
+            model_type=ModelType.LLM,
+            features=[
+                ModelFeature.AGENT_THOUGHT,
+            ],
+            fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
+            model_properties={
+                ModelPropertyKey.MODE: LLMMode.CHAT.value,
+                ModelPropertyKey.CONTEXT_SIZE: 200000,
+            },
+            parameter_rules=[
+                _temperature_rule(),
+                _top_p_rule(),
+                _presence_penalty_rule(),
+                _frequency_penalty_rule(),
+                _max_tokens_rule(default=8192, minimum=1, maximum=200000),
+                _response_format_rule(),
+            ],
+            pricing=PriceConfig(
+                input=0,
+                output=0,
+                unit=0.001,
+                currency="USD",
+            ),
+        ),
+    ),
+    AzureBaseModel(
+        base_model_name="openai4.1",
+        supports_streaming=True,
+        entity=AIModelEntity(
+            model="fake-deployment-name",
+            label=I18nObject(
+                en_US="openai4.1",
+                zh_Hans="openai4.1",
+                ja_JP="openai4.1",
+            ),
             model_type=ModelType.LLM,
             features=[
                 ModelFeature.MULTI_TOOL_CALL,
@@ -112,19 +137,23 @@ LLM_MODELS: Dict[str, LlmModelConfig] = {
                 _response_format_rule(),
             ],
             pricing=PriceConfig(
-                input=Decimal("0"),
-                output=Decimal("0"),
-                unit=Decimal("0.001"),
+                input=0,
+                output=0,
+                unit=0.001,
                 currency="USD",
             ),
         ),
     ),
-    "openai5": LlmModelConfig(
+    AzureBaseModel(
         base_model_name="openai5",
-        supports_sse=True,
+        supports_streaming=True,
         entity=AIModelEntity(
-            model="openai5",
-            label=I18nObject(en_US="openai5", zh_Hans="openai5", ja_JP="openai5"),
+            model="fake-deployment-name",
+            label=I18nObject(
+                en_US="openai5",
+                zh_Hans="openai5",
+                ja_JP="openai5",
+            ),
             model_type=ModelType.LLM,
             features=[
                 ModelFeature.MULTI_TOOL_CALL,
@@ -145,22 +174,63 @@ LLM_MODELS: Dict[str, LlmModelConfig] = {
                 _response_format_rule(),
             ],
             pricing=PriceConfig(
-                input=Decimal("0"),
-                output=Decimal("0"),
-                unit=Decimal("0.001"),
+                input=0,
+                output=0,
+                unit=0.001,
                 currency="USD",
             ),
         ),
     ),
-    "claude-v4sonnet": LlmModelConfig(
-        base_model_name="claude-v4sonnet",
-        supports_sse=False,
+    AzureBaseModel(
+        base_model_name="gemini-2.5-flash",
+        supports_streaming=False,
         entity=AIModelEntity(
-            model="claude-v4sonnet",
-            label=I18nObject(en_US="claude-v4sonnet", zh_Hans="claude-v4sonnet", ja_JP="claude-v4sonnet"),
+            model="fake-deployment-name",
+            label=I18nObject(
+                en_US="gemini-2.5-flash",
+                zh_Hans="gemini-2.5-flash",
+                ja_JP="gemini-2.5-flash",
+            ),
+            model_type=ModelType.LLM,
+            features=[
+                ModelFeature.AGENT_THOUGHT,
+            ],
+            fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
+            model_properties={
+                ModelPropertyKey.MODE: LLMMode.CHAT.value,
+                ModelPropertyKey.CONTEXT_SIZE: 100000,
+            },
+            parameter_rules=[
+                _temperature_rule(),
+                _top_p_rule(),
+                _presence_penalty_rule(),
+                _frequency_penalty_rule(),
+                _max_tokens_rule(default=4096, minimum=1, maximum=100000),
+                _response_format_rule(),
+            ],
+            pricing=PriceConfig(
+                input=0,
+                output=0,
+                unit=0.001,
+                currency="USD",
+            ),
+        ),
+    ),
+    AzureBaseModel(
+        base_model_name="gemini-2.5-pro",
+        supports_streaming=True,
+        entity=AIModelEntity(
+            model="fake-deployment-name",
+            label=I18nObject(
+                en_US="gemini-2.5-pro",
+                zh_Hans="gemini-2.5-pro",
+                ja_JP="gemini-2.5-pro",
+            ),
             model_type=ModelType.LLM,
             features=[
                 ModelFeature.MULTI_TOOL_CALL,
+                ModelFeature.AGENT_THOUGHT,
+                ModelFeature.STREAM_TOOL_CALL,
             ],
             fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
             model_properties={
@@ -172,162 +242,77 @@ LLM_MODELS: Dict[str, LlmModelConfig] = {
                 _top_p_rule(),
                 _presence_penalty_rule(),
                 _frequency_penalty_rule(),
-                _max_tokens_rule(default=4096, minimum=1, maximum=4096),
+                _max_tokens_rule(default=8192, minimum=1, maximum=200000),
                 _response_format_rule(),
             ],
             pricing=PriceConfig(
-                input=Decimal("0"),
-                output=Decimal("0"),
-                unit=Decimal("0.001"),
+                input=0,
+                output=0,
+                unit=0.001,
                 currency="USD",
             ),
         ),
     ),
-    "gemini-2.5-flash": LlmModelConfig(
-        base_model_name="gemini-2.5-flash",
-        supports_sse=False,
-        entity=AIModelEntity(
-            model="gemini-2.5-flash",
-            label=I18nObject(en_US="gemini-2.5-flash", zh_Hans="gemini-2.5-flash", ja_JP="gemini-2.5-flash"),
-            model_type=ModelType.LLM,
-            features=[
-                ModelFeature.MULTI_TOOL_CALL,
-            ],
-            fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
-            model_properties={
-                ModelPropertyKey.MODE: LLMMode.CHAT.value,
-                ModelPropertyKey.CONTEXT_SIZE: 1048576,
-            },
-            parameter_rules=[
-                _temperature_rule(),
-                _top_p_rule(),
-                _presence_penalty_rule(),
-                _frequency_penalty_rule(),
-                _max_tokens_rule(default=8192, minimum=1, maximum=1048576),
-                _response_format_rule(),
-            ],
-            pricing=PriceConfig(
-                input=Decimal("0"),
-                output=Decimal("0"),
-                unit=Decimal("0.001"),
-                currency="USD",
-            ),
-        ),
-    ),
-    "gemini-2.5-pro": LlmModelConfig(
-        base_model_name="gemini-2.5-pro",
-        supports_sse=True,
-        entity=AIModelEntity(
-            model="gemini-2.5-pro",
-            label=I18nObject(en_US="gemini-2.5-pro", zh_Hans="gemini-2.5-pro", ja_JP="gemini-2.5-pro"),
-            model_type=ModelType.LLM,
-            features=[
-                ModelFeature.MULTI_TOOL_CALL,
-                ModelFeature.AGENT_THOUGHT,
-                ModelFeature.STREAM_TOOL_CALL,
-            ],
-            fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
-            model_properties={
-                ModelPropertyKey.MODE: LLMMode.CHAT.value,
-                ModelPropertyKey.CONTEXT_SIZE: 2097152,
-            },
-            parameter_rules=[
-                _temperature_rule(),
-                _top_p_rule(),
-                _presence_penalty_rule(),
-                _frequency_penalty_rule(),
-                _max_tokens_rule(default=32768, minimum=1, maximum=2097152),
-                _response_format_rule(),
-            ],
-            pricing=PriceConfig(
-                input=Decimal("0"),
-                output=Decimal("0"),
-                unit=Decimal("0.001"),
-                currency="USD",
-            ),
-        ),
-    ),
-}
+]
 
 
-def resolve_llm_model(base_model_name: str) -> LlmModelConfig:
-    config = LLM_MODELS.get(base_model_name)
-    if not config:
-        raise CredentialsValidateFailedError(f"Unsupported base model '{base_model_name}'.")
-    return config
-
-
-@dataclass(frozen=True)
-class EmbeddingModelConfig:
-    base_model_name: str
-    entity: AIModelEntity
-
-    def clone_with_deployment(self, deployment: str) -> AIModelEntity:
-        entity_copy = deepcopy(self.entity)
-        entity_copy.model = deployment
-        if entity_copy.label is None:
-            entity_copy.label = I18nObject(en_US=deployment)
-        else:
-            for attr in ("en_US", "zh_Hans", "ja_JP"):
-                if hasattr(entity_copy.label, attr):
-                    setattr(entity_copy.label, attr, deployment)
-        return entity_copy
-
-
-EMBEDDING_MODELS: Dict[str, EmbeddingModelConfig] = {
-    "text-embedding-3-small": EmbeddingModelConfig(
+EMBEDDING_BASE_MODELS = [
+    AzureBaseModel(
         base_model_name="text-embedding-3-small",
         entity=AIModelEntity(
-            model="text-embedding-3-small",
+            model="fake-deployment-name",
             label=I18nObject(
                 en_US="text-embedding-3-small",
                 zh_Hans="text-embedding-3-small",
                 ja_JP="text-embedding-3-small",
             ),
-            model_type=ModelType.TEXT_EMBEDDING,
             fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
+            model_type=ModelType.TEXT_EMBEDDING,
             model_properties={
                 ModelPropertyKey.CONTEXT_SIZE: 8191,
                 ModelPropertyKey.MAX_CHUNKS: 32,
             },
-            parameter_rules=[],
             pricing=PriceConfig(
-                input=Decimal("0"),
-                output=None,
-                unit=Decimal("0.001"),
+                input=0,
+                unit=0.001,
                 currency="USD",
             ),
         ),
     ),
-    "text-embedding-3-large": EmbeddingModelConfig(
+    AzureBaseModel(
         base_model_name="text-embedding-3-large",
         entity=AIModelEntity(
-            model="text-embedding-3-large",
+            model="fake-deployment-name",
             label=I18nObject(
                 en_US="text-embedding-3-large",
                 zh_Hans="text-embedding-3-large",
                 ja_JP="text-embedding-3-large",
             ),
-            model_type=ModelType.TEXT_EMBEDDING,
             fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
+            model_type=ModelType.TEXT_EMBEDDING,
             model_properties={
                 ModelPropertyKey.CONTEXT_SIZE: 8191,
                 ModelPropertyKey.MAX_CHUNKS: 32,
             },
-            parameter_rules=[],
             pricing=PriceConfig(
-                input=Decimal("0"),
-                output=None,
-                unit=Decimal("0.001"),
+                input=0,
+                unit=0.001,
                 currency="USD",
             ),
         ),
     ),
-}
+]
 
 
-def resolve_embedding_model(base_model_name: str) -> EmbeddingModelConfig:
-    config = EMBEDDING_MODELS.get(base_model_name)
-    if not config:
-        raise CredentialsValidateFailedError(f"Unsupported embedding base model '{base_model_name}'.")
-    return config
+def get_llm_base_model(base_model_name: str) -> AzureBaseModel | None:
+    for candidate in LLM_BASE_MODELS:
+        if candidate.base_model_name == base_model_name:
+            return candidate
+    return None
+
+
+def get_embedding_base_model(base_model_name: str) -> AzureBaseModel | None:
+    for candidate in EMBEDDING_BASE_MODELS:
+        if candidate.base_model_name == base_model_name:
+            return candidate
+    return None

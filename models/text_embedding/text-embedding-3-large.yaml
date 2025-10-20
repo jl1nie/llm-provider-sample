@@ -5,7 +5,9 @@ label:
   zh_Hans: text-embedding-3-large
 model_type: text-embedding
 features: []
-model_properties: {}
+model_properties:
+  context_size: 8191
+  max_chunks: 32
 parameter_rules:
   - name: dimensions
     label:

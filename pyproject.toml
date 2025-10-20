@@ -1,11 +1,14 @@
 [project]
 name = "llm-provider-sample"
-version = "0.0.5"
+version = "0.1.0"
 description = "Dify LLM provider sample plugin"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = [
-    "dify-plugin==0.4.5",
-    "httpx>=0.28.1,<0.29.0",
+    "dify-plugin>=0.5.0,<0.6.0",
+    "openai>=2.3.0,<3.0.0",
+    "tiktoken>=0.8.0,<0.9.0",
+    "numpy>=2.0.0,<3.0.0",
+    "pillow>=10.0.0,<12.0.0",
 ]
 
 [build-system]
